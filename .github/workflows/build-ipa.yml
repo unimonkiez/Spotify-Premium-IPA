@@ -1,0 +1,108 @@
+name: IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: Decrypted Spotify IPA URL
+        required: true
+        type: string
+      eevee_tag:
+        description: EeveeSpotify release tag (leave empty for latest)
+        required: false
+        default: ""
+        type: string
+      eevee_repo:
+        description: EeveeSpotify repository
+        required: false
+        default: whoeevee/EeveeSpotifyReborn
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: levibostian/action-hide-sensitive-inputs@v1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Setup
+        run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+      - name: Spotify
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$IPA_URL" == "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/"* ]]; then
+            curl --fail --location \
+              --header "Accept: application/octet-stream" \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              "$IPA_URL" --output Spotify.ipa
+          else
+            curl --fail --location "$IPA_URL" --output Spotify.ipa
+          fi
+          file_type=$(file --mime-type -b Spotify.ipa)
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            exit 1
+          fi
+
+      - name: EeveeSpotify
+        id: eevee
+        env:
+          EEVEE_REPO: ${{ inputs.eevee_repo }}
+          EEVEE_TAG: ${{ inputs.eevee_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$EEVEE_TAG" ]; then
+            release_path="releases/tags/$EEVEE_TAG"
+          else
+            release_path="releases/latest"
+          fi
+          curl --fail --silent \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$EEVEE_REPO/$release_path" --output release.json
+          mkdir debs
+          for prefix in com.eevee.spotify org.swift.protobuf.swiftprotobuf; do
+            url=$(jq -r --arg prefix "$prefix" \
+              '.assets[] | select((.name | startswith($prefix)) and (.name | endswith("_iphoneos-arm.deb"))) | .browser_download_url' \
+              release.json | head -1)
+            test -n "$url"
+            curl --fail --location "$url" --output "debs/$(basename "$url")"
+          done
+          eevee_version=$(ls debs | sed -n 's/^com\.eevee\.spotify_\(.*\)_iphoneos-arm\.deb$/\1/p')
+          echo "version=$eevee_version" >> "$GITHUB_OUTPUT"
+
+      - name: Inject
+        id: inject
+        run: |
+          spotify_version="$(python3 - <<'PY'
+          import plistlib
+          import zipfile
+
+          with zipfile.ZipFile('Spotify.ipa') as archive:
+              info = next(name for name in archive.namelist()
+                          if name.startswith('Payload/') and name.count('/') == 2
+                          and name.endswith('.app/Info.plist'))
+              print(plistlib.loads(archive.read(info))['CFBundleShortVersionString'])
+          PY
+          )"
+          output="EeveeSpotify_${{ steps.eevee.outputs.version }}_Spotify_${spotify_version}.ipa"
+          cyan -i Spotify.ipa -o "$output" \
+            -f debs/org.swift.protobuf.swiftprotobuf_*.deb debs/com.eevee.spotify_*.deb \
+            -u -w -d --overwrite
+          unzip -l "$output" | grep -q 'Frameworks/Orion.framework/Orion'
+          echo "ipa=$output" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: EeveeSpotify-IPA
+          path: ${{ steps.inject.outputs.ipa }}
+          if-no-files-found: error
